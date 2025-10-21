@@ -1,0 +1,712 @@
+-- Module Script
+-- ServerScriptService/DestructionService.lua
+-- One-module version: physics + regeneration + rewards + temp debris toggle
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local PhysicsService = game:GetService("PhysicsService")
+local recentlyHit = false
+
+local M = {}
+
+-- ================= Debris / Impact Tunables =================
+local IMPULSE_PER_MASS            = 1000    -- outward impulse per kg
+local MAX_LAUNCH_SPEED            = 20     -- debris speed clamp
+local ANGULAR_IMPULSE_PER_MASS    = 40     -- spin
+local INNER_DELETE_RADIUS_DEFAULT = 0      -- default (tools can override)
+local DEFAULT_DELETE_MODE         = "parts" -- "parts" or "build"
+
+-- Performance control: only this many parts get physics forces (base budget)
+local MAX_PHYSICS_PARTS           = 80
+
+-- Single-wave deletion timing for physics subset
+local DEBRIS_DELETE_DELAY         = 2.0    -- seconds parts fly before deletion
+local DEBRIS_FADE_TIME            = 1.0    -- fade time for physics subset
+local GROUND_COLLIDE_DELAY        = 0.08   -- seconds
+-- ============================================================
+
+-- -------------- Slicing tunables (already in your file) --------------
+local LARGE_HIT_PARTS_THRESHOLD = 120
+local SLICE_SIZE_REPARENT = 40        -- how many parts to reparent per frame
+local SLICE_SIZE_FORCES   = 35        -- how many parts to impulse per frame
+-- We’ll reuse SLICE_SIZE_FORCES as the combined slice size for interleaving.
+-- ------------------------------------------------------------
+
+-- -------------- ★ Large-blast expansion (new) --------------
+local PHYSICS_FRACTION_LARGE    = 0.35
+local PHYSICS_HARD_CAP          = 240
+local BREAK_WELDS_ON_LARGE      = true
+-- ------------------------------------------------------------
+
+-- Global backpressure caps
+local ACTIVE_SHARDS_SOFT_CAP = 600
+local ACTIVE_SHARDS_HARD_CAP = 1200
+
+-- Micro cooldown to prevent re-hitting same big build every frame
+local HIT_IMMUNITY_WINDOW = 0.15
+
+-- Failsafe sweeper tunables
+local SWEEP_INTERVAL = 1
+
+-- ================= Regeneration pacing ======================
+local REGEN_THRESHOLD_DEFAULT     = 0.50
+local REGEN_DELAY_SECONDS         = 2
+local REGEN_COOLDOWN_AFTER_HIT    = 0
+local REGEN_FADEIN_TIME           = 0.6
+local REGEN_FADEIN_SLICE_SIZE     = 20
+-- ============================================================
+
+-- ================ Audio (optional) ==========================
+local EXPLOSION_SOUND_ID          = ""
+local EXPLOSION_SOUND_VOLUME      = 1.0
+local EXPLOSION_SOUND_PITCH       = 1.0
+-- ============================================================
+
+-- ================ Micro switches ============================
+local OPT_SET_SERVER_OWNERSHIP    = true
+-- ============================================================
+
+-- ================= Cached objects / pools ===================
+local partBoundsParams  = OverlapParams.new()
+partBoundsParams.FilterType = Enum.RaycastFilterType.Include
+
+local fadeTweenInfo     = TweenInfo.new(DEBRIS_FADE_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+local regenTweenInfo    = TweenInfo.new(REGEN_FADEIN_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+local _pool = {
+	candidates = {},
+	physicsSubset = {},
+	instantSubset = {},
+}
+-- ============================================================
+
+-- ================== Debris Toggle & Remotes =================
+local _DEBRIS_ENABLED = true
+function M.SetDebrisEnabled(enabled) _DEBRIS_ENABLED = not not enabled end
+function M.GetDebrisEnabled() return _DEBRIS_ENABLED end
+
+local toggleEvent = ReplicatedStorage.RemoteEventFolder:FindFirstChild("Destruction_ToggleDebris")
+local getStateFn  = ReplicatedStorage.RemoteFunctionFolder:FindFirstChild("Destruction_GetDebrisEnabled")
+
+getStateFn.OnServerInvoke = function()
+	return _DEBRIS_ENABLED
+end
+
+local lastToggle, COOLDOWN = {}, 0.25
+toggleEvent.OnServerEvent:Connect(function(player)
+	local now = os.clock()
+	if (lastToggle[player] or 0) + COOLDOWN > now then return end
+	lastToggle[player] = now
+	_DEBRIS_ENABLED = not _DEBRIS_ENABLED
+end)
+
+-- ==== NEW collision-group helpers (replace your old ones) ====
+local DEBRIS_GROUP = "Debris"
+local _groupSetupDone = false
+
+local function ensureDebrisCollisionGroup()
+	if _groupSetupDone then return end
+	_groupSetupDone = true
+	PhysicsService:RegisterCollisionGroup(DEBRIS_GROUP)
+	PhysicsService:CollisionGroupSetCollidable(DEBRIS_GROUP, DEBRIS_GROUP, false)
+end
+
+local function putInDebrisGroup(p: BasePart)
+	ensureDebrisCollisionGroup()
+	p.CollisionGroup = DEBRIS_GROUP
+end
+-- ============================================================
+
+-- Stats tracked per FULL BUILD (direct child of Destroyables)
+-- fullStats[fullModel] = { totalParts, destroyedParts, regenThreshold, originalPivot, template, lastHitAt, regenToken }
+local fullStats = {}
+
+local destroyablesFolder
+local templatesFolder
+
+-- ---------- helpers ----------
+local function getDebrisBin()
+	local bin = workspace:FindFirstChild("_BuildDebrisBin")
+	if not bin then
+		bin = Instance.new("Folder")
+		bin.Name = "_BuildDebrisBin"
+		bin.Parent = workspace
+	end
+	return bin
+end
+
+-- ★ Lightly loosen joints so big chunks can separate and fly
+local function breakWeldsLight(part)
+	if part:IsA("BasePart") then
+		part:BreakJoints()
+		for _, c in ipairs(part:GetChildren()) do
+			if c:IsA("WeldConstraint") then
+				c.Enabled = false
+			end
+		end
+	end
+end
+
+local function quickFadeAndDestroy(part, fadeTime)
+	if not part or not part.Parent then return end
+	if fadeTime <= 0 then
+		part:Destroy()
+		return
+	end
+	local ok = pcall(function()
+		local tw = TweenService:Create(part, fadeTweenInfo, {Transparency = 1})
+		tw:Play()
+	end)
+	task.delay(fadeTime + 0.05, function()
+		if part and part.Parent then part:Destroy() end
+	end)
+	if not ok and part and part.Parent then part:Destroy() end
+end
+
+-- Failsafe sweeper: periodically fades stale shards in _BuildDebrisBin
+local _sweepStarted = false
+local function ensureSweeper()
+	if _sweepStarted then return end
+	_sweepStarted = true
+
+	task.spawn(function()
+		local last = os.clock()
+		while true do
+			RunService.Heartbeat:Wait()
+			local now = os.clock()
+			if now - last >= SWEEP_INTERVAL then
+				last = now
+				local bin = workspace:FindFirstChild("_BuildDebrisBin")
+				if bin then
+					for _, inst in ipairs(bin:GetChildren()) do
+						if inst:IsA("BasePart") then
+							local expireAt = inst:GetAttribute("ExpireAt")
+							local swept = inst:GetAttribute("Swept")
+							if typeof(expireAt) == "number" and expireAt <= now and not swept then
+								inst:SetAttribute("Swept", true)
+								quickFadeAndDestroy(inst, DEBRIS_FADE_TIME)
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function getPartsInRadius(origin, radius, includeFolder)
+	if includeFolder then
+		partBoundsParams.FilterDescendantsInstances = { includeFolder }
+	end
+	return workspace:GetPartBoundsInRadius(origin, radius, partBoundsParams)
+end
+
+-- Climb to the direct child Model of destroyablesFolder (the "Full Build")
+local function findFullBuild(inst)
+	if not destroyablesFolder then return nil end
+	local node = inst
+	while node and node ~= destroyablesFolder do
+		local parent = node.Parent
+		if parent == destroyablesFolder and node:IsA("Model") then
+			return node
+		end
+		node = parent
+	end
+	return nil
+end
+
+local function countBaseParts(root)
+	local n = 0
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then n += 1 end
+	end
+	return n
+end
+
+local function pivotOf(modelOrFolder)
+	if modelOrFolder:IsA("Model") then
+		return modelOrFolder:GetPivot()
+	else
+		local bp = modelOrFolder:FindFirstChildWhichIsA("BasePart", true)
+		return bp and CFrame.new(bp.Position) or CFrame.new()
+	end
+end
+
+local function clampVelocityAssembly(part, maxSpeed)
+	local root = part.AssemblyRootPart or part
+	local vel = root.AssemblyLinearVelocity
+	if vel.Magnitude > maxSpeed then
+		root.AssemblyLinearVelocity = vel.Unit * maxSpeed
+	end
+end
+
+-- Seamless launch: unanchor, disable contact briefly, and set velocities NOW.
+
+
+local function playExplosionSound(pos)
+	if EXPLOSION_SOUND_ID == "" then return end
+	local s = Instance.new("Sound")
+	s.SoundId = EXPLOSION_SOUND_ID
+	s.Volume = EXPLOSION_SOUND_VOLUME
+	s.PlaybackSpeed = EXPLOSION_SOUND_PITCH
+	s.RollOffMode = Enum.RollOffMode.Linear
+	s.EmitterSize = 25
+	s.MaxDistance = 300
+	s.Parent = workspace.Terrain
+	s.Position = pos
+	s:Play()
+	Debris:AddItem(s, 5)
+end
+
+local function shuffle(t)
+	for i = #t, 2, -1 do
+		local j = math.random(i)
+		t[i], t[j] = t[j], t[i]
+	end
+	return t
+end
+
+local function processInSlices(items, sliceSize, perItemFn, onDone)
+	local i, n = 1, #items
+	local function step()
+		local limit = math.min(i + sliceSize - 1, n)
+		for k = i, limit do
+			perItemFn(items[k])
+		end
+		i = limit + 1
+		if i <= n then
+			RunService.Heartbeat:Wait()
+			step()
+		else
+			if onDone then onDone() end
+		end
+	end
+	step()
+end
+
+-- Prime a shard to move next sim step: unanchor, disable contacts, set temp owner
+local function primeForPhysics(part: BasePart, attacker: Player?, holdSeconds: number)
+	if not (part and part.Parent and part:IsA("BasePart")) then return end
+	part.Anchored   = false
+	part.CanCollide = false
+	part.CanTouch   = false
+	part.CanQuery   = false
+	putInDebrisGroup(part)
+
+	-- temp ownership to shooter so motion is authored immediately on their client
+	if attacker and part:CanSetNetworkOwnership() then
+		pcall(function() part:SetNetworkOwner(attacker) end)
+		task.delay(holdSeconds or 0.30, function()
+			if part and part.Parent and part:CanSetNetworkOwnership() then
+				pcall(function() part:SetNetworkOwner(nil) end)
+			end
+		end)
+	else
+		if part:CanSetNetworkOwnership() then
+			pcall(function() part:SetNetworkOwner(nil) end)
+		end
+	end
+end
+
+
+-- ---------- end helpers ----------
+
+-- ---------- regen (FULL BUILD) ----------
+local function regenerateFull(full)
+	local fs = fullStats[full]
+	if not fs then return end
+
+	-- Remove old
+	if full and full.Parent then full:Destroy() end
+
+	-- Spawn fresh
+	local newFull = fs.template:Clone()
+	if newFull:IsA("Model") then
+		newFull:PivotTo(fs.originalPivot)
+	end
+	newFull.Parent = destroyablesFolder
+
+	-- Refresh stats
+	fullStats[newFull] = {
+		totalParts     = countBaseParts(newFull),
+		destroyedParts = 0,
+		regenThreshold = fs.regenThreshold,
+		originalPivot  = fs.originalPivot,
+		template       = fs.template,
+		lastHitAt      = 0,
+		regenToken     = 0,
+	}
+	fullStats[full] = nil
+
+	-- -------- SLICED FADE-IN --------
+	local fadeParts = {}
+	for _, d in ipairs(newFull:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Transparency = 1
+			table.insert(fadeParts, d)
+		end
+	end
+
+	processInSlices(fadeParts, REGEN_FADEIN_SLICE_SIZE, function(part)
+		if part and part.Parent and part:IsA("BasePart") then
+			pcall(function()
+				local tw = TweenService:Create(part, regenTweenInfo, {Transparency = 0})
+				tw:Play()
+			end)
+		end
+	end)
+	-- -------- end sliced fade-in ----
+end
+
+local function scheduleRegen(full)
+	local fs = fullStats[full]
+	if not fs then return end
+
+	local frac = fs.destroyedParts / math.max(1, fs.totalParts)
+	if frac < fs.regenThreshold then return end
+
+	fs.regenToken += 1
+	local token = fs.regenToken
+
+	task.delay(REGEN_DELAY_SECONDS, function()
+		local fstate = fullStats[full]
+		if not fstate or fstate.regenToken ~= token then return end
+		local quiet = os.clock() - (fstate.lastHitAt or 0)
+		if quiet < REGEN_COOLDOWN_AFTER_HIT then
+			scheduleRegen(full)
+			return
+		end
+		if (fstate.destroyedParts / math.max(1, fstate.totalParts)) >= fstate.regenThreshold then
+			regenerateFull(full)
+		end
+	end)
+end
+-- ---------- end regen ----------
+
+-- ---------- rewards ----------
+local function awardPlayer(attacker, totalPartsDestroyed, perPartValue, rewardMultiplier)
+	if not attacker or totalPartsDestroyed <= 0 then return end
+	rewardMultiplier = rewardMultiplier or 1.0
+	perPartValue = perPartValue or 1
+	local ls = attacker:FindFirstChild("leaderstats"); if not ls then return end
+	local coins = ls:FindFirstChild("Coins"); if not coins then return end
+	coins.Value += math.floor(totalPartsDestroyed * perPartValue * rewardMultiplier)
+end
+-- ---------- end rewards ----------
+
+-- =============== Public API ===============
+
+function M.InitializeBuilds(folder, serverStorage)
+	destroyablesFolder = folder
+
+	templatesFolder = serverStorage:FindFirstChild("BuildTemplates") or Instance.new("Folder")
+	templatesFolder.Name = "BuildTemplates"
+	templatesFolder.Parent = serverStorage
+
+	for _, full in ipairs(folder:GetChildren()) do
+		if full:IsA("Model") then
+			local total = countBaseParts(full)
+			local pivot = pivotOf(full)
+
+			local rtVal = REGEN_THRESHOLD_DEFAULT
+			do
+				local nv = full:FindFirstChild("RegenThreshold")
+				if nv and nv:IsA("NumberValue") then
+					rtVal = math.clamp(nv.Value, 0, 1)
+				end
+			end
+
+			local existing = templatesFolder:FindFirstChild(full.Name)
+			if existing then existing:Destroy() end
+			local tpl = full:Clone(); tpl.Name = full.Name; tpl.Parent = templatesFolder
+
+			fullStats[full] = {
+				totalParts     = math.max(1, total),
+				destroyedParts = 0,
+				regenThreshold = rtVal,
+				originalPivot  = pivot,
+				template       = tpl,
+				lastHitAt      = 0,
+				regenToken     = 0,
+			}
+		end
+	end
+end
+
+function M.Explode(origin, radius, options)
+	print("[Explode] called at", origin, "radius", radius)
+
+	if not destroyablesFolder then
+		print("[Explode] abort: destroyablesFolder missing")
+		return
+	end
+
+	local attacker         = options.attacker
+	local exclude          = options.exclude
+	local deleteMode       = options.deleteMode or DEFAULT_DELETE_MODE
+	local innerRadius      = (options.innerDeleteRadius ~= nil) and options.innerDeleteRadius or INNER_DELETE_RADIUS_DEFAULT
+	local forcePerKg       = options.forcePerKg or IMPULSE_PER_MASS
+	local maxSpeed         = options.maxSpeed   or MAX_LAUNCH_SPEED
+	local spinPerKg        = options.spinPerKg  or ANGULAR_IMPULSE_PER_MASS
+	local showExplosion    = (options.showExplosion ~= false)
+	local rewardMultiplier = options.rewardMultiplier or 1.0
+
+	print("[Explode] attacker=", attacker, "exclude=", exclude, "deleteMode=", deleteMode)
+
+	-- Visual boom
+	if showExplosion then
+		print("[Explode] showing explosion VFX")
+		local e = Instance.new("Explosion")
+		e.Position = origin
+		e.BlastRadius = 0
+		e.BlastPressure = 0
+		e.Parent = workspace
+		if EXPLOSION_SOUND_ID ~= "" then
+			playExplosionSound(origin)
+		end
+	end
+
+	local parts = getPartsInRadius(origin, radius, destroyablesFolder)
+	print("[Explode] found", #parts, "parts in radius")
+
+	-- "Destroy whole build" mode
+	if deleteMode == "build" then
+		print("[Explode] deleteMode=build")
+		local seenFull = {}
+		for _, part in ipairs(parts) do
+			if part:IsA("BasePart") and not (exclude and part:IsDescendantOf(exclude)) then
+				local full = findFullBuild(part)
+				if full and fullStats[full] then
+					seenFull[full] = true
+				end
+			end
+		end
+		print("[Explode] full builds to nuke:", #seenFull)
+		for full in pairs(seenFull) do
+			local fs = fullStats[full]
+			if fs then
+				local valueNV = full:FindFirstChild("Value") or full:FindFirstChildWhichIsA("NumberValue", true)
+				local perPartValue = (valueNV and valueNV:IsA("NumberValue") and valueNV.Name == "Value" and valueNV.Value) or 1
+				awardPlayer(attacker, fs.totalParts, perPartValue, rewardMultiplier)
+				fs.destroyedParts = fs.totalParts
+				fs.lastHitAt = os.clock()
+				print("[Explode] nuked full build", full.Name)
+			end
+		end
+		for full in pairs(seenFull) do
+			if fullStats[full] then scheduleRegen(full) end
+		end
+		return
+	end
+
+	-- Gather candidate parts
+	local candidates = {}
+	for _, part in ipairs(parts) do
+		if part:IsA("BasePart") and not (exclude and part:IsDescendantOf(exclude)) then
+			local mdl = part:FindFirstAncestorOfClass("Model")
+			if not (mdl and Players:GetPlayerFromCharacter(mdl)) then
+				table.insert(candidates, part)
+			end
+		end
+	end
+	local totalHit = #candidates
+	print("[Explode] candidates:", totalHit)
+	if totalHit == 0 then return end
+
+	-- Fixed physics budget
+	shuffle(candidates)
+	local physicsSubset, instantSubset = {}, {}
+	for i, p in ipairs(candidates) do
+		if i <= MAX_PHYSICS_PARTS then
+			table.insert(physicsSubset, p)
+		else
+			table.insert(instantSubset, p)
+		end
+	end
+	print("[Explode] physicsSubset:", #physicsSubset, "instantSubset:", #instantSubset)
+
+	-- Rewards + regen tracking
+	local perFullCounts = {}
+	for _, p in ipairs(candidates) do
+		local full = findFullBuild(p)
+		if full and fullStats[full] then
+			perFullCounts[full] = (perFullCounts[full] or 0) + 1
+		end
+	end
+	print("[Explode] perFullCounts:", perFullCounts)
+
+	local regenQueue = {}
+	for full, inc in pairs(perFullCounts) do
+		local fs = fullStats[full]
+		if fs then
+			local valueNV = full:FindFirstChild("Value") or full:FindFirstChildWhichIsA("NumberValue", true)
+			local perPartValue = (valueNV and valueNV:IsA("NumberValue") and valueNV.Name == "Value" and valueNV.Value) or 1
+			awardPlayer(attacker, inc, perPartValue, rewardMultiplier)
+			fs.destroyedParts = math.clamp(fs.destroyedParts + inc, 0, fs.totalParts)
+			fs.lastHitAt = os.clock()
+			if fs.destroyedParts / math.max(1, fs.totalParts) >= fs.regenThreshold then
+				table.insert(regenQueue, full)
+			end
+			print("[Explode] updated stats for", full.Name, "destroyedParts", fs.destroyedParts)
+		end
+	end
+
+	-- Debris OFF
+	if not _DEBRIS_ENABLED then
+		print("[Explode] debris disabled — deleting instantly")
+		for _, p in ipairs(instantSubset) do
+			if p and p.Parent and p:IsA("BasePart") then quickFadeAndDestroy(p, 0) end
+		end
+		for _, p in ipairs(physicsSubset) do
+			if p and p.Parent and p:IsA("BasePart") then quickFadeAndDestroy(p, 0) end
+		end
+		for _, full in ipairs(regenQueue) do
+			if fullStats[full] then scheduleRegen(full) end
+		end
+		return
+	end
+
+	-- Debris ON
+	print("[Explode] debris enabled")
+	local debrisBin = getDebrisBin()
+	ensureSweeper()
+
+	-- Decide if we slice this hit
+	local doSlice = (totalHit >= LARGE_HIT_PARTS_THRESHOLD)
+	print(("[Explode] doSlice=%s   threshold=%d"):format(tostring(doSlice), LARGE_HIT_PARTS_THRESHOLD))
+
+	----------------------------------------------------------------
+	-- Phase A: PRIME shards this frame (unanchor, contacts off, temp owner)
+	----------------------------------------------------------------
+	if not doSlice then
+		for _, part in ipairs(physicsSubset) do
+			primeForPhysics(part, attacker, 0.30)
+		end
+	else
+		processInSlices(physicsSubset, SLICE_SIZE_REPARENT, function(part)
+			primeForPhysics(part, attacker, 0.30)
+		end)
+	end
+
+	-- Wait exactly one physics step so the anchor flip/ownership settle
+	RunService.Stepped:Wait()
+
+	----------------------------------------------------------------
+	-- Phase B: Apply forces/velocities (no re-anchoring), then parent
+	----------------------------------------------------------------
+	local function forceOne(part)
+		if not (part and part.Parent and part:IsA("BasePart")) then return end
+
+		if doSlice and BREAK_WELDS_ON_LARGE then
+			breakWeldsLight(part)
+		end
+
+		local toPart  = part.Position - origin
+		local dist    = math.max(0.1, toPart.Magnitude)
+		local falloff = 1 - math.clamp(dist / radius, 0, 1)
+		falloff = falloff * falloff
+
+		if innerRadius > 0 and dist <= innerRadius then
+			local kick = toPart.Unit * (forcePerKg * part:GetMass() * 0.25)
+			if part.ApplyImpulseAtPosition then
+				part:ApplyImpulseAtPosition(kick, origin)
+			else
+				part:ApplyImpulse(kick)
+			end
+			clampVelocityAssembly(part, maxSpeed)
+		else
+			local dir = toPart / dist
+			local targetSpeed = math.min(forcePerKg * falloff, maxSpeed)
+			local root = part.AssemblyRootPart or part
+			root.AssemblyLinearVelocity = dir * targetSpeed
+
+			local rnd = Vector3.new(math.random()-0.5, math.random()-0.5, math.random()-0.5)
+			if rnd.Magnitude > 0 then
+				root.AssemblyAngularVelocity = rnd.Unit * (spinPerKg * falloff)
+			end
+
+			local J = dir * (forcePerKg * part:GetMass() * falloff)
+			if part.ApplyImpulseAtPosition then
+				part:ApplyImpulseAtPosition(J, origin)
+			else
+				part:ApplyImpulse(J)
+			end
+		end
+
+		-- (keep temp ownership from prime; it will revert after the hold window)
+	end
+
+	local function parentAndSchedule(part)
+		if not (part and part.Parent and part:IsA("BasePart")) then return end
+		part.Parent = debrisBin
+		part:SetAttribute("ExpireAt", os.clock() + DEBRIS_DELETE_DELAY + DEBRIS_FADE_TIME + 0.25)
+		task.delay(GROUND_COLLIDE_DELAY, function()
+			if part and part.Parent and part:IsA("BasePart") then
+				part.CanCollide = true
+			end
+		end)
+	end
+
+	local t_forces_start = os.clock()
+	if not doSlice then
+		for _, part in ipairs(physicsSubset) do forceOne(part) end
+		for _, part in ipairs(physicsSubset) do parentAndSchedule(part) end
+	else
+		local sliceBuffer = {}
+		processInSlices(physicsSubset, SLICE_SIZE_FORCES, function(part)
+			if part and part.Parent and part:IsA("BasePart") then
+				forceOne(part)
+				table.insert(sliceBuffer, part)
+			end
+		end, function()
+			for _, part in ipairs(sliceBuffer) do parentAndSchedule(part) end
+		end)
+	end
+	local t_forces_end = os.clock()
+	print(("[Explode] forces+parent done  parts=%d   dt=%.4f")
+		:format(#physicsSubset, t_forces_end - t_forces_start))
+
+	----------------------------------------------------------------
+	-- Instant subset: make invisible immediately, delete in slices
+	----------------------------------------------------------------
+	task.defer(function()
+		for _, p in ipairs(instantSubset) do
+			if p and p.Parent and p:IsA("BasePart") then
+				p.CanCollide = false
+				p.CanTouch   = false
+				p.CanQuery   = false
+				p.Transparency = 1
+			end
+		end
+		processInSlices(instantSubset, 150, function(p)
+			if p and p.Parent and p:IsA("BasePart") then
+				p:Destroy()
+			end
+		end)
+	end)
+
+	-- Regen after debris staged
+	for _, full in ipairs(regenQueue) do
+		if fullStats[full] then scheduleRegen(full) end
+	end
+
+	-- Cleanup physics debris after linger — batched fade
+	task.delay(DEBRIS_DELETE_DELAY, function()
+		local t_cleanup = os.clock()
+		print(("[Explode] cleanup start at t=%.6f  (delay=%.2f)"):format(t_cleanup, DEBRIS_DELETE_DELAY))
+		processInSlices(physicsSubset, 40, function(p)
+			if p and p.Parent and p:IsA("BasePart") then
+				quickFadeAndDestroy(p, DEBRIS_FADE_TIME)
+			end
+		end)
+	end)
+end
+
+
+
+-- <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+return M
