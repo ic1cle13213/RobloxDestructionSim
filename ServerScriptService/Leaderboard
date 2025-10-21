@@ -1,0 +1,15 @@
+-- Server Script
+local Players = game:GetService("Players")
+
+Players.PlayerAdded:Connect(function(plr)
+	-- leaderstats container
+	local ls = Instance.new("Folder")
+	ls.Name = "leaderstats"
+	ls.Parent = plr
+
+	-- Coins
+	local coins = Instance.new("IntValue")
+	coins.Name = "Coins"
+	coins.Value = 0
+	coins.Parent = ls
+end)
