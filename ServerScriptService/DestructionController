@@ -1,0 +1,23 @@
+-- ServerScript
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+
+-- RemoteEvent setup
+local refolder = ReplicatedStorage:FindFirstChild("RemoteEventFolder") or Instance.new("Folder")
+refolder.Name = "RemoteEventFolder"
+refolder.Parent = ReplicatedStorage
+
+local explodeEvent = refolder:FindFirstChild("ExplodeAt") or Instance.new("RemoteEvent")
+explodeEvent.Name = "ExplodeAt"
+explodeEvent.Parent = refolder
+
+-- Service module
+local DestructionService = require(script.Parent:WaitForChild("DestructionService"))
+
+-- Snapshot builds on boot
+DestructionService.InitializeBuilds(workspace:WaitForChild("Destroyable Models"), ServerStorage)
+
+-- Any weapon/tool can call this
+explodeEvent.OnServerEvent:Connect(function(player, origin: Vector3, radius: number, opts: table?)
+	DestructionService.Explode(origin, radius, opts or {})
+end)
